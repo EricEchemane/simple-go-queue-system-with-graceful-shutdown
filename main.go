@@ -11,6 +11,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
 var q chan int
@@ -44,8 +46,15 @@ func main() {
 		}
 	}()
 
+	limiter := rate.NewLimiter(rate.Limit(1000), 5)
 	server := &http.Server{Addr: ":8080"}
-	http.HandleFunc("/", index)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !limiter.Allow() {
+			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
+			return
+		}
+		index(w, r)
+	})
 	go server.ListenAndServe()
 	log.Println("Running on port 8080")
 
