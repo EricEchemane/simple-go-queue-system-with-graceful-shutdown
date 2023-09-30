@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"math/rand"
@@ -25,15 +26,14 @@ func worker(item int) {
 
 func index(w http.ResponseWriter, req *http.Request) {
 	wg.Add(1)
-	go worker(rand.Int())
-	fmt.Fprintf(w, "hello\n")
+	item := rand.Int()
+	go worker(item)
+	time.Sleep(time.Second * 10) // simulate some process
+	fmt.Fprintf(w, "%d", item)
 }
 
 func main() {
 	q = make(chan int)
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
-
 	go func() {
 		for {
 			select {
@@ -44,13 +44,24 @@ func main() {
 		}
 	}()
 
+	server := &http.Server{Addr: ":8080"}
 	http.HandleFunc("/", index)
-	go http.ListenAndServe(":8080", nil)
+	go server.ListenAndServe()
 	log.Println("Running on port 8080")
 
+	shutdown := make(chan os.Signal, 1)
+	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 	<-shutdown
 	log.Println("Shutting down gracefully...")
 
 	log.Println("Waiting for other workers to complete")
 	wg.Wait()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := server.Shutdown(ctx)
+	if err != nil {
+		log.Printf("Error encountered while stopping HTTP listener: %s\n", err)
+	}
 }
