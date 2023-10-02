@@ -12,18 +12,24 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/time/rate"
 )
 
-var q chan int
 var wg sync.WaitGroup
+var redisClient *redis.Client
 
 func worker(item int) {
 	defer wg.Done()
 	delay := rand.Intn(7)
 	log.Printf("ongoing: %d received processing in %ds\n", item, delay)
 	time.Sleep(time.Second * time.Duration(delay))
-	q <- item
+
+	key := fmt.Sprintf("queue:%d", item)
+	err := redisClient.Set(context.Background(), key, item, 0).Err()
+	if err != nil {
+		log.Printf("Failed to push item to Redis queue: %v", err)
+	}
 }
 
 func index(w http.ResponseWriter, req *http.Request) {
@@ -35,13 +41,35 @@ func index(w http.ResponseWriter, req *http.Request) {
 }
 
 func main() {
-	q = make(chan int)
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	pong, err := redisClient.Ping(context.Background()).Result()
+	if err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Printf("Connected to Redis: %s", pong)
+
 	go func() {
-		for {
-			select {
-			case item := <-q:
-				log.Printf("done: %d processed\n", item)
-			case <-time.After(time.Millisecond):
+		for range time.Tick(time.Millisecond) {
+			// Use GET to retrieve and process items from the Redis queue
+			key, err := redisClient.Keys(context.Background(), "queue:*").Result()
+			if err != nil {
+				log.Printf("Failed to fetch keys from Redis: %v", err)
+				continue
+			}
+
+			for _, k := range key {
+				item, err := redisClient.Get(context.Background(), k).Result()
+				if err != nil {
+					log.Printf("Failed to get item from Redis: %v", err)
+					continue
+				}
+
+				log.Printf("done: %s processed\n", item)
+
+				// delete after processing
+				redisClient.Del(context.Background(), k)
 			}
 		}
 	}()
@@ -69,8 +97,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	err := server.Shutdown(ctx)
-	if err != nil {
+	if err := server.Shutdown(ctx); err != nil {
 		log.Printf("Error encountered while stopping HTTP listener: %s\n", err)
 	}
 }
