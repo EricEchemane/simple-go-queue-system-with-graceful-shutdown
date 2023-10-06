@@ -8,69 +8,61 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
-	"golang.org/x/time/rate"
+	"github.com/segmentio/kafka-go"
 )
 
-var q chan int
-var wg sync.WaitGroup
-
-func worker(item int) {
-	defer wg.Done()
-	delay := rand.Intn(7)
-	log.Printf("ongoing: %d received processing in %ds\n", item, delay)
-	time.Sleep(time.Second * time.Duration(delay))
-	q <- item
-}
-
-func index(w http.ResponseWriter, req *http.Request) {
-	wg.Add(1)
-	item := rand.Int()
-	go worker(item)
-	time.Sleep(time.Second * 10) // simulate some process
-	fmt.Fprintf(w, "%d", item)
-}
-
 func main() {
-	q = make(chan int)
-	go func() {
-		for {
-			select {
-			case item := <-q:
-				log.Printf("done: %d processed\n", item)
-			case <-time.After(time.Millisecond):
-			}
-		}
-	}()
 
-	limiter := rate.NewLimiter(rate.Limit(1000), 5)
 	server := &http.Server{Addr: ":8080"}
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if !limiter.Allow() {
-			http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
-			return
-		}
-		index(w, r)
+
+	topic := "quickstart-events"
+	kafkaWriter := kafka.NewWriter(kafka.WriterConfig{
+		Brokers: []string{"localhost:9092"},
+		Topic:   topic,
 	})
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		random_message := rand.Int()
+		fmt.Fprint(w, random_message)
+
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			log.Printf("processing: %d\n", random_message)
+			err := kafkaWriter.WriteMessages(ctx, kafka.Message{Value: []byte(fmt.Sprint(random_message))})
+			if err != nil {
+				log.Println("failed to write message to Kafka:", err)
+			}
+		}()
+	})
+
 	go server.ListenAndServe()
 	log.Println("Running on port 8080")
+
+	kafkaReader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers: []string{"localhost:9092"},
+		Topic:   topic,
+	})
+
+	go func() {
+		for {
+			message, err := kafkaReader.ReadMessage(context.Background())
+			if err != nil {
+				log.Println("failed to read message from Kafka:", err)
+				break
+			}
+			fmt.Printf("Received message: %+v\n", message)
+		}
+	}()
 
 	shutdown := make(chan os.Signal, 1)
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 	<-shutdown
 	log.Println("Shutting down gracefully...")
 
-	log.Println("Waiting for other workers to complete")
-	wg.Wait()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	err := server.Shutdown(ctx)
-	if err != nil {
-		log.Printf("Error encountered while stopping HTTP listener: %s\n", err)
-	}
+	kafkaWriter.Close()
+	kafkaReader.Close()
 }
